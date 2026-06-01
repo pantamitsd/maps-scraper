@@ -2,6 +2,11 @@ name: Maps Scraper
 
 on:
   workflow_dispatch:
+    inputs:
+      batch_no:
+        description: "Batch Number"
+        required: true
+        default: "1"
 
 jobs:
   scrape:
@@ -24,11 +29,14 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Scraper
+        env:
+          BATCH_NO: ${{ github.event.inputs.batch_no }}
         run: |
+          echo "Running Batch $BATCH_NO"
           python scraper.py
 
       - name: Upload CSV
         uses: actions/upload-artifact@v4
         with:
-          name: business_websites
+          name: business_websites_batch_${{ github.event.inputs.batch_no }}
           path: business_websites.csv
