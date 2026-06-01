@@ -34,11 +34,22 @@ from tqdm import tqdm
 
 # ===================== CONFIG =====================
 with open("queries.txt", "r", encoding="utf-8") as f:
-    SEARCH_QUERIES = [
+    ALL_QUERIES = [
         line.strip()
         for line in f
         if line.strip()
     ]
+
+BATCH_SIZE = 20
+BATCH_NO = int(os.getenv("BATCH_NO", "1"))
+
+start = (BATCH_NO - 1) * BATCH_SIZE
+end = start + BATCH_SIZE
+
+SEARCH_QUERIES = ALL_QUERIES[start:end]
+
+print(f"Running Batch {BATCH_NO}")
+print(f"Queries {start+1} to {min(end, len(ALL_QUERIES))}")
 
 MAX_LISTINGS      = 500    # per query
 OUTPUT_CSV        = "business_websites.csv"
