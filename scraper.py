@@ -51,15 +51,15 @@ SEARCH_QUERIES = ALL_QUERIES[start:end]
 print(f"Running Batch {BATCH_NO}")
 print(f"Queries {start+1} to {min(end, len(ALL_QUERIES))}")
 
-MAX_LISTINGS      = 500    # per query
+MAX_LISTINGS      = 100    # per query
 OUTPUT_CSV        = "business_websites.csv"
 HEADLESS          = True   # True = faster (no rendering overhead)
 
 # ── Tuned for i3-1215U + 16 GB RAM ──────────────────────────
-PARALLEL_DRIVERS  = 5      # sweet spot: enough concurrency, no CPU throttle
+PARALLEL_DRIVERS  = 2      # sweet spot: enough concurrency, no CPU throttle
 SCROLL_PAUSE      = 0.3    # works well with eager page load
 PLACE_LOAD_WAIT   = 2.0    # reduced — eager loading means DOM arrives faster
-COLLECT_WORKERS   = 3      # parallel drivers for Phase 1 (href collection)
+COLLECT_WORKERS   = 1      # parallel drivers for Phase 1 (href collection)
 SAVE_EVERY        = 50     # write CSV every N new records (crash safety)
 MAX_RETRIES       = 2      # retries per place page on failure
 # ─────────────────────────────────────────────────────────────
