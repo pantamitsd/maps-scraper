@@ -40,16 +40,9 @@ with open("queries.txt", "r", encoding="utf-8") as f:
         if line.strip()
     ]
 
-BATCH_SIZE = 20
-BATCH_NO = int(os.getenv("BATCH_NO", "1"))
+SEARCH_QUERIES = ALL_QUERIES
 
-start = (BATCH_NO - 1) * BATCH_SIZE
-end = start + BATCH_SIZE
-
-SEARCH_QUERIES = ALL_QUERIES[start:end]
-
-print(f"Running Batch {BATCH_NO}")
-print(f"Queries {start+1} to {min(end, len(ALL_QUERIES))}")
+print(f"Running {len(SEARCH_QUERIES)} queries")
 
 MAX_LISTINGS      = 100    # per query
 OUTPUT_CSV        = "business_websites.csv"
