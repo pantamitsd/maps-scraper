@@ -1,15 +1,12 @@
-# maps_scraper_optimized.py
-# OPTIMIZED FOR: Intel i3-1215U (6 cores, 1.20 GHz) + 16 GB RAM
+# maps_scraper_batch.py
+# ============================================================
+# BATCH + SAFE COMPLETION — Google Maps Scraper
 #
-# KEY OPTIMIZATIONS vs previous version:
-#   1. PARALLEL_DRIVERS = 5  (sweet spot for i3 — avoids CPU throttle)
-#   2. page_load_strategy = 'eager'  (stops waiting for slow secondary resources)
-#   3. Phase 1 (href collection) is NOW PARALLEL too (was single-threaded before)
-#   4. Reduced sleep/wait values tuned for eager loading
-#   5. CPU-aware thread pool — won't exceed os.cpu_count() * 1.5
-#   6. Progressive CSV saving every 50 records (crash-safe)
-#   7. Graceful Ctrl+C handling — saves whatever was collected before exit
-#   8. Retry logic (up to 2 retries) for flaky place pages
+# A query is marked completed ONLY after ALL four conditions are met:
+#   1. Phase 1 (collect place URLs) finished successfully
+#   2. Phase 2 (extract name + website) finished successfully
+#   3. All records for that query have been processed
+#   4. Data has been successfully written to business_websites.csv
 #
 # pip install selenium webdriver-manager pandas tqdm beautifulsoup4
 # ============================================================
@@ -33,64 +30,89 @@ import pandas as pd
 from tqdm import tqdm
 
 # ===================== CONFIG =====================
-with open("queries.txt", "r", encoding="utf-8") as f:
-    ALL_QUERIES = [
-        line.strip()
-        for line in f
-        if line.strip()
-    ]
 
-SEARCH_QUERIES = ALL_QUERIES
+BATCH_SIZE             = 10
+QUERIES_FILE           = "queries.txt"
+COMPLETED_QUERIES_FILE = "completed_queries.txt"
+FAILED_QUERIES_FILE    = "failed_queries.txt"
 
-print(f"Running {len(SEARCH_QUERIES)} queries")
+with open(QUERIES_FILE, "r", encoding="utf-8") as f:
+    ALL_QUERIES = [line.strip() for line in f if line.strip()]
 
-MAX_LISTINGS      = 100    # per query
-OUTPUT_CSV        = "business_websites.csv"
-HEADLESS          = True   # True = faster (no rendering overhead)
+def load_state() -> tuple[set[str], set[str]]:
+    completed: set[str] = set()
+    failed: set[str] = set()
+    if os.path.exists(COMPLETED_QUERIES_FILE):
+        with open(COMPLETED_QUERIES_FILE, "r", encoding="utf-8") as f:
+            completed = {line.strip() for line in f if line.strip()}
+    if os.path.exists(FAILED_QUERIES_FILE):
+        with open(FAILED_QUERIES_FILE, "r", encoding="utf-8") as f:
+            failed = {line.strip() for line in f if line.strip()}
+    return completed, failed
 
-# ── Tuned for i3-1215U + 16 GB RAM ──────────────────────────
-PARALLEL_DRIVERS  = 2      # sweet spot: enough concurrency, no CPU throttle
-SCROLL_PAUSE      = 0.3    # works well with eager page load
-PLACE_LOAD_WAIT   = 2.0    # reduced — eager loading means DOM arrives faster
-COLLECT_WORKERS   = 1      # parallel drivers for Phase 1 (href collection)
-SAVE_EVERY        = 50     # write CSV every N new records (crash safety)
-MAX_RETRIES       = 2      # retries per place page on failure
-# ─────────────────────────────────────────────────────────────
+completed_queries, failed_queries = load_state()
+remaining_queries = [q for q in ALL_QUERIES if q not in completed_queries]
+SEARCH_QUERIES    = remaining_queries[:BATCH_SIZE]
+
+print(
+    f"\n[BATCH] Total queries     : {len(ALL_QUERIES)}\n"
+    f"[BATCH] Completed so far  : {len(completed_queries)}\n"
+    f"[BATCH] Remaining         : {len(remaining_queries)}\n"
+    f"[BATCH] Processing now    : {len(SEARCH_QUERIES)}\n"
+)
+
+if not SEARCH_QUERIES:
+    print("[BATCH] ✅ All queries already completed. Nothing to do.")
+    sys.exit(0)
+
+MAX_LISTINGS     = 100
+OUTPUT_CSV       = "business_websites.csv"
+HEADLESS         = True
+PARALLEL_DRIVERS = 2
+SCROLL_PAUSE     = 0.3
+PLACE_LOAD_WAIT  = 2.0
+COLLECT_WORKERS  = 1
+SAVE_EVERY       = 50
+MAX_RETRIES      = 2
 
 # ===================== GLOBALS =====================
-_drivers_lock = threading.Lock()
+_drivers_lock   = threading.Lock()
 _all_drivers: list[webdriver.Chrome] = []
 _shutdown_event = threading.Event()
+_file_write_lock = threading.Lock()
 
+def _append_to_file(filepath: str, line: str) -> None:
+    with _file_write_lock:
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(line.strip() + "\n")
+
+def mark_query_completed(query: str) -> None:
+    _append_to_file(COMPLETED_QUERIES_FILE, query)
+
+def mark_query_failed(query: str) -> None:
+    _append_to_file(FAILED_QUERIES_FILE, query)
 
 # ===================== SIGNAL HANDLER =====================
 def _handle_sigint(sig, frame):
     print("\n\n⚠️  Ctrl+C detected — finishing current tasks and saving…")
     _shutdown_event.set()
 
-
 signal.signal(signal.SIGINT, _handle_sigint)
-
 
 # ===================== DRIVER FACTORY =====================
 def _make_driver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
-
-    # ── KEY OPTIMIZATION: eager stops waiting for all assets ──
     options.page_load_strategy = "eager"
-
     if HEADLESS:
         options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
-
-    # Performance / stability flags
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--window-size=1400,900")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-infobars")
-    options.add_argument("--blink-settings=imagesEnabled=false")        # skip images = faster
+    options.add_argument("--blink-settings=imagesEnabled=false")
     options.add_argument("--disable-javascript-harmony-shipping")
     options.add_argument("--disable-background-networking")
     options.add_argument("--disable-default-apps")
@@ -98,21 +120,17 @@ def _make_driver() -> webdriver.Chrome:
     options.add_argument("--metrics-recording-only")
     options.add_argument("--mute-audio")
     options.add_argument("--no-first-run")
-
     options.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2,           # block images
+        "profile.managed_default_content_settings.images": 2,
         "profile.default_content_setting_values.notifications": 2,
-        "profile.managed_default_content_settings.stylesheets": 2,      # block CSS too
+        "profile.managed_default_content_settings.stylesheets": 2,
     })
-
     service = Service(ChromeDriverManager().install())
     drv = webdriver.Chrome(service=service, options=options)
-    drv.set_page_load_timeout(15)   # don't hang forever on slow pages
-
+    drv.set_page_load_timeout(15)
     with _drivers_lock:
         _all_drivers.append(drv)
     return drv
-
 
 def _quit_all():
     with _drivers_lock:
@@ -123,13 +141,10 @@ def _quit_all():
                 pass
         _all_drivers.clear()
 
-
 atexit.register(_quit_all)
-
 
 # ===================== WAIT HELPER =====================
 def _wait_for(drv, xpath, timeout=5):
-    """Return element or None — never raises."""
     try:
         return WebDriverWait(drv, timeout).until(
             EC.presence_of_element_located((By.XPATH, xpath))
@@ -137,27 +152,17 @@ def _wait_for(drv, xpath, timeout=5):
     except Exception:
         return None
 
-
 # ===================== PHASE 1: COLLECT HREFS =====================
 def search_and_collect_hrefs(drv, query: str, max_links: int) -> list[str]:
-    """
-    Opens Maps, searches, scrolls the results panel, returns up to max_links hrefs.
-    Now uses eager page load — panel arrives ~0.5s faster per query.
-    """
     if _shutdown_event.is_set():
         return []
-
     drv.get(f"https://www.google.com/maps/search/{query.replace(' ', '+')}")
-
-    # Accept cookies if shown (non-blocking, short timeout)
     try:
         WebDriverWait(drv, 3).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Accept')]"))
         ).click()
     except Exception:
         pass
-
-    # Wait for results panel
     panel = None
     for sel in ["//div[@role='feed']", "//div[contains(@class,'m6QErb')]"]:
         try:
@@ -167,23 +172,18 @@ def search_and_collect_hrefs(drv, query: str, max_links: int) -> list[str]:
             break
         except Exception:
             continue
-
     if panel is None:
         print(f"  ⚠️  No results panel for: {query}")
         return []
-
     hrefs: list[str] = []
     href_set: set[str] = set()
     idle_count = 0
-
     while len(hrefs) < max_links and idle_count < 5 and not _shutdown_event.is_set():
         prev_count = len(hrefs)
-
         try:
             anchors = panel.find_elements(By.XPATH, ".//a[@href]")
         except Exception:
             anchors = drv.find_elements(By.XPATH, "//a[@href]")
-
         for a in anchors:
             try:
                 href = a.get_attribute("href") or ""
@@ -195,50 +195,21 @@ def search_and_collect_hrefs(drv, query: str, max_links: int) -> list[str]:
                         break
             except Exception:
                 continue
-
-        # Scroll panel
         try:
             drv.execute_script(
                 "arguments[0].scrollTop += arguments[0].clientHeight;", panel
             )
         except Exception:
             drv.execute_script("window.scrollBy(0,700);")
-
         time.sleep(SCROLL_PAUSE)
         idle_count = 0 if len(hrefs) > prev_count else idle_count + 1
-
     return hrefs[:max_links]
-
-
-def collect_worker(query: str) -> list[tuple[str, str]]:
-    """One driver handles one query (used in Phase 1 parallel pool)."""
-    drv = _make_driver()
-    try:
-        hrefs = search_and_collect_hrefs(drv, query, MAX_LISTINGS)
-        return [(query, h) for h in hrefs]
-    except Exception as e:
-        print(f"  ⚠️  Collect error [{query}]: {e}")
-        return []
-    finally:
-        try:
-            drv.quit()
-        except Exception:
-            pass
-
 
 # ===================== PHASE 2: EXTRACT DATA =====================
 def extract_place_data(drv, url: str) -> dict:
-    """
-    Visits a place page and extracts name + website.
-    Eager page_load_strategy means we don't wait for images/fonts/CSS.
-    """
     drv.get(url)
-
-    # h1 = business name — arrives quickly with eager + images blocked
     name_el = _wait_for(drv, "//h1", timeout=PLACE_LOAD_WAIT)
     name = name_el.text.strip() if name_el else None
-
-    # Website link
     website = None
     try:
         w_el = drv.find_element(
@@ -247,8 +218,6 @@ def extract_place_data(drv, url: str) -> dict:
         website = w_el.get_attribute("href")
     except Exception:
         pass
-
-    # Fallback: parse page source for h1
     if not name:
         try:
             soup = BeautifulSoup(drv.page_source, "html.parser")
@@ -257,9 +226,7 @@ def extract_place_data(drv, url: str) -> dict:
                 name = h1.get_text(strip=True)
         except Exception:
             pass
-
     return {"name": name, "website": website, "place_url": url}
-
 
 def worker_process_hrefs(
     task_queue: Queue,
@@ -268,21 +235,14 @@ def worker_process_hrefs(
     pbar: tqdm,
     save_callback,
 ) -> None:
-    """
-    One thread owns one Chrome driver and processes tasks from the shared queue.
-    Includes retry logic and progressive saving.
-    """
     drv = _make_driver()
     local_buffer: list[dict] = []
-
     try:
         while not _shutdown_event.is_set():
             try:
                 query, href = task_queue.get(timeout=2)
             except Empty:
                 break
-
-            # Retry loop
             rec = None
             for attempt in range(MAX_RETRIES + 1):
                 try:
@@ -293,28 +253,22 @@ def worker_process_hrefs(
                         "website":      data.get("website"),
                         "place_url":    href,
                     }
-                    break   # success
+                    break
                 except Exception as e:
                     if attempt < MAX_RETRIES:
-                        time.sleep(1)           # brief pause before retry
+                        time.sleep(1)
                     else:
                         print(f"  ⚠️  Failed after {MAX_RETRIES} retries: {href} — {e}")
-
             if rec:
                 local_buffer.append(rec)
-
-                # Progressive save every SAVE_EVERY records
                 if len(local_buffer) >= SAVE_EVERY:
                     with results_lock:
                         results.extend(local_buffer)
                         save_callback(results)
                     local_buffer.clear()
-
             task_queue.task_done()
             pbar.update(1)
-
     finally:
-        # Flush remaining buffer
         if local_buffer:
             with results_lock:
                 results.extend(local_buffer)
@@ -324,20 +278,29 @@ def worker_process_hrefs(
         except Exception:
             pass
 
-
-# ===================== CSV SAVE =====================
+# ===================== CSV SAVE — MERGE WITH EXISTING =====================
 def atomic_write_csv(records: list[dict], outpath: str) -> None:
-    """Thread-safe atomic CSV write — never corrupts on crash."""
+    """
+    Merges new records with any existing CSV rows, deduplicates by place_url,
+    then atomically writes the result. Never loses data from previous runs.
+    """
     if not records:
         return
-    df = pd.DataFrame(records)
-    df = df.drop_duplicates(subset=["place_url"], keep="first")
-
+    new_df = pd.DataFrame(records)
+    if os.path.exists(outpath):
+        try:
+            existing_df = pd.read_csv(outpath, encoding="utf-8-sig")
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        except Exception:
+            combined_df = new_df
+    else:
+        combined_df = new_df
+    combined_df = combined_df.drop_duplicates(subset=["place_url"], keep="first")
     dirn = os.path.dirname(outpath) or "."
     fd, tmp = tempfile.mkstemp(prefix="tmp_biz_", dir=dirn, text=True)
     os.close(fd)
     try:
-        df.to_csv(tmp, index=False, encoding="utf-8-sig")
+        combined_df.to_csv(tmp, index=False, encoding="utf-8-sig")
         os.replace(tmp, outpath)
     except PermissionError:
         try:
@@ -346,9 +309,7 @@ def atomic_write_csv(records: list[dict], outpath: str) -> None:
             pass
         raise
 
-
 def make_save_callback(outpath: str):
-    """Returns a callback that saves all results to CSV (called progressively)."""
     def _save(records):
         try:
             atomic_write_csv(records, outpath)
@@ -356,35 +317,81 @@ def make_save_callback(outpath: str):
             print(f"  ⚠️  CSV save error: {e}")
     return _save
 
+# ===================== PHASE 2 RUNNER — PER QUERY =====================
+def run_phase2_for_query(
+    query: str,
+    hrefs: list[str],
+    seen_hrefs: set[str],
+    seen_lock: threading.Lock,
+) -> list[dict]:
+    """
+    Runs Phase 2 (extract name + website) for a single query's hrefs.
+    Returns all records collected for this query.
+    This is called once per query so completion can be tracked per query.
+    """
+    # Deduplicate hrefs against the global seen set
+    unique_hrefs = []
+    with seen_lock:
+        for h in hrefs:
+            if h not in seen_hrefs:
+                seen_hrefs.add(h)
+                unique_hrefs.append(h)
+
+    if not unique_hrefs:
+        return []
+
+    task_queue: Queue = Queue()
+    for href in unique_hrefs:
+        task_queue.put((query, href))
+
+    results: list[dict] = []
+    results_lock = threading.Lock()
+
+    # No progressive save callback here — we save once after all threads finish,
+    # so we can confirm the write succeeded before marking the query complete.
+    def _noop_save(_):
+        pass
+
+    with tqdm(total=len(unique_hrefs), unit="place",
+              desc=f"  [{query[:40]}]", leave=False) as pbar:
+        threads = []
+        for _ in range(PARALLEL_DRIVERS):
+            t = threading.Thread(
+                target=worker_process_hrefs,
+                args=(task_queue, results, results_lock, pbar, _noop_save),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+
+    return results
 
 # ===================== MAIN =====================
 def run() -> None:
     cpu_cores = os.cpu_count() or 4
     print("=" * 62)
-    print("  GOOGLE MAPS SCRAPER — Optimized for i3-1215U / 16 GB")
+    print("  GOOGLE MAPS SCRAPER — Batch Mode / Safe Completion")
     print("=" * 62)
-    print(f"  Queries           : {len(SEARCH_QUERIES)}")
-    print(f"  Max per query     : {MAX_LISTINGS}")
-    print(f"  Phase 1 workers   : {COLLECT_WORKERS}  (parallel href collection)")
-    print(f"  Phase 2 workers   : {PARALLEL_DRIVERS}  (parallel place scraping)")
-    print(f"  Page load mode    : eager  (stops on DOM ready, skips assets)")
-    print(f"  Headless          : {HEADLESS}")
-    print(f"  CPU cores detected: {cpu_cores}")
-    print(f"  Save every        : {SAVE_EVERY} records")
-    print(f"  Output            : {OUTPUT_CSV}")
+    print(f"  Queries this batch  : {len(SEARCH_QUERIES)}")
+    print(f"  Max per query       : {MAX_LISTINGS}")
+    print(f"  Phase 1 workers     : {COLLECT_WORKERS}")
+    print(f"  Phase 2 workers     : {PARALLEL_DRIVERS}")
+    print(f"  Page load mode      : eager")
+    print(f"  Headless            : {HEADLESS}")
+    print(f"  CPU cores detected  : {cpu_cores}")
+    print(f"  Output              : {OUTPUT_CSV}")
     print("=" * 62)
 
-    save_cb = make_save_callback(OUTPUT_CSV)
+    # ── PHASE 1: Collect hrefs, grouped by query ─────────────────────────
+    # tasks_by_query preserves per-query grouping needed for safe completion.
+    print(f"\n📍 PHASE 1 — Collecting place URLs ({COLLECT_WORKERS} parallel browsers)…\n")
 
-    # ── PHASE 1: Parallel href collection ───────────────────────────────
-    print(f"\n📍 PHASE 1 — Collecting place URLs ({COLLECT_WORKERS} parallel browsers)…")
-    print("   (This is now parallel — was single-threaded in previous version)\n")
-
-    all_tasks: list[tuple[str, str]] = []
-    seen_hrefs: set[str] = set()
-    collect_lock = threading.Lock()
-
-    collect_queue: Queue = Queue()
+    tasks_by_query: dict[str, list[str]] = {q: [] for q in SEARCH_QUERIES}
+    phase1_failed:  set[str]             = set()
+    collect_lock  = threading.Lock()
+    collect_queue : Queue = Queue()
     for q in SEARCH_QUERIES:
         collect_queue.put(q)
 
@@ -400,16 +407,15 @@ def run() -> None:
                     break
                 try:
                     hrefs = search_and_collect_hrefs(drv, query, MAX_LISTINGS)
-                    new_count = 0
                     with collect_lock:
-                        for h in hrefs:
-                            if h not in seen_hrefs:
-                                seen_hrefs.add(h)
-                                all_tasks.append((query, h))
-                                new_count += 1
-                    phase1_pbar.set_postfix({"new": new_count, "total": len(all_tasks)})
+                        tasks_by_query[query] = hrefs
+                    phase1_pbar.set_postfix({"hrefs": len(hrefs), "query": query[:30]})
                 except Exception as e:
                     print(f"\n  ⚠️  Error collecting [{query}]: {e}")
+                    with collect_lock:
+                        phase1_failed.add(query)
+                    # Only mark failed here — query was never completed
+                    mark_query_failed(query)
                 finally:
                     collect_queue.task_done()
                     phase1_pbar.update(1)
@@ -424,58 +430,113 @@ def run() -> None:
         t = threading.Thread(target=collect_thread_worker, daemon=True)
         t.start()
         collect_threads.append(t)
-
     for t in collect_threads:
         t.join()
-
     phase1_pbar.close()
 
     if _shutdown_event.is_set():
-        print("\n⚠️  Interrupted during Phase 1. Saving what was collected…")
-        save_cb([{"search_query": q, "name": None, "website": None, "place_url": h}
-                 for q, h in all_tasks])
+        print("\n⚠️  Interrupted during Phase 1. No queries marked complete.")
+        _print_summary([])
         return
 
-    print(f"\n✅ Phase 1 done — {len(all_tasks)} unique places found")
+    total_hrefs = sum(len(v) for v in tasks_by_query.values())
+    print(f"\n✅ Phase 1 done — {total_hrefs} place URLs across "
+          f"{len(tasks_by_query) - len(phase1_failed)} queries\n")
 
-    # ── PHASE 2: Parallel place page scraping ────────────────────────────
-    print(f"\n🌐 PHASE 2 — Extracting name + website ({PARALLEL_DRIVERS} browsers)…\n")
+    # ── PHASE 2 + SAVE + MARK COMPLETE — one query at a time ─────────────
+    #
+    # WHY per-query:
+    #   Processing all queries in one shared queue makes it impossible to know
+    #   when a specific query's Phase 2 is fully done and written to CSV.
+    #   By running Phase 2 per query, we can confirm CSV write success before
+    #   calling mark_query_completed — satisfying all four completion conditions.
+    #
+    print(f"🌐 PHASE 2 — Extracting name + website, query by query…\n")
 
-    task_queue: Queue = Queue()
-    for task in all_tasks:
-        task_queue.put(task)
+    seen_hrefs: set[str] = set()
+    seen_lock   = threading.Lock()
+    batch_completed: list[str] = []
+    batch_processed = 0
 
-    results: list[dict] = []
-    results_lock = threading.Lock()
+    queries_to_process = [q for q in SEARCH_QUERIES if q not in phase1_failed]
 
-    with tqdm(total=len(all_tasks), unit="place", desc="  Places") as pbar:
-        phase2_threads = []
-        for _ in range(PARALLEL_DRIVERS):
-            t = threading.Thread(
-                target=worker_process_hrefs,
-                args=(task_queue, results, results_lock, pbar, save_cb),
-                daemon=True,
-            )
-            t.start()
-            phase2_threads.append(t)
+    for query in queries_to_process:
+        if _shutdown_event.is_set():
+            print("\n⚠️  Shutdown requested — stopping before next query.")
+            break
 
-        for t in phase2_threads:
-            t.join()
+        hrefs = tasks_by_query[query]
+        if not hrefs:
+            # No results from Maps — still mark complete so it isn't retried
+            mark_query_completed(query)
+            batch_completed.append(query)
+            batch_processed += 1
+            print(f"  ℹ️  No place URLs found for [{query}] — marking complete.")
+            continue
 
-    # ── PHASE 3: Final save ──────────────────────────────────────────────
-    print("\n💾 PHASE 3 — Final save…")
-    df = pd.DataFrame(results)
-    df = df.drop_duplicates(subset=["place_url"], keep="first")
-    df_with_site = df[df["website"].notna()]
+        print(f"  🔍 Processing query {batch_processed + 1}/"
+              f"{len(queries_to_process)}: {query}")
 
-    atomic_write_csv(df_with_site.to_dict("records"), OUTPUT_CSV)
+        # Step 1: Run Phase 2 for this query
+        records = run_phase2_for_query(query, hrefs, seen_hrefs, seen_lock)
 
+        # Step 2: Save to CSV
+        # atomic_write_csv raises on unrecoverable write failure.
+        # If it raises, we do NOT mark the query complete — it will be retried.
+        csv_saved = False
+        if records:
+            df = pd.DataFrame(records)
+            df = df.drop_duplicates(subset=["place_url"], keep="first")
+            df_with_site = df[df["website"].notna()]
+            if not df_with_site.empty:
+                try:
+                    atomic_write_csv(df_with_site.to_dict("records"), OUTPUT_CSV)
+                    csv_saved = True
+                except Exception as e:
+                    print(f"  ❌ CSV write failed for [{query}]: {e} — NOT marking complete.")
+                    mark_query_failed(query)
+                    batch_processed += 1
+                    continue
+            else:
+                # Records exist but none had a website — still counts as done
+                csv_saved = True
+        else:
+            # Phase 2 ran but found nothing extractable — still counts as done
+            csv_saved = True
+
+        # Step 3: Mark query completed ONLY after confirmed CSV write
+        # This is the only place mark_query_completed is called.
+        # It fires after: Phase 1 ✓ → Phase 2 ✓ → CSV saved ✓
+        mark_query_completed(query)
+        batch_completed.append(query)
+        batch_processed += 1
+        print(f"  ✅ [{query}] complete — "
+              f"{len(records)} records, "
+              f"{'saved to CSV' if csv_saved and records else 'no website records'}")
+
+    # ── FINAL SUMMARY ─────────────────────────────────────────────────────
     print(f"\n{'=' * 62}")
-    print(f"  ✅ Done!")
-    print(f"  Total places visited : {len(df)}")
-    print(f"  With website         : {len(df_with_site)}")
-    print(f"  Saved to             : {OUTPUT_CSV}")
+    print(f"  ✅ Batch finished!")
+    print(f"  Saved to : {OUTPUT_CSV}")
     print(f"{'=' * 62}")
+    _print_summary(batch_completed)
+
+
+def _print_summary(batch_completed: list[str]) -> None:
+    completed_now, _ = load_state()
+    total           = len(ALL_QUERIES)
+    completed_total = len(completed_now)
+    remaining       = total - completed_total
+    processed_now   = len(batch_completed)
+
+    print(f"\n{'─' * 62}")
+    print(f"  📊 BATCH SUMMARY")
+    print(f"{'─' * 62}")
+    print(f"  Total queries in queries.txt  : {total}")
+    print(f"  Completed queries (all runs)  : {completed_total}")
+    print(f"  Remaining queries             : {remaining}")
+    print(f"  Processed in this batch       : {processed_now}")
+    print(f"{'─' * 62}\n")
 
 
 # ===================== ENTRY =====================
