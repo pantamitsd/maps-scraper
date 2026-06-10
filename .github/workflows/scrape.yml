@@ -3,13 +3,20 @@ name: Maps Scraper
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: "0 */1 * * *"   # Every 1 hour
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
+    timeout-minutes: 330
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -28,7 +35,28 @@ jobs:
           python scraper.py
 
       - name: Upload CSV
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: business_websites
-          path: business_websites.csv
+          path: |
+            business_websites.csv
+            completed_queries.txt
+            failed_queries.txt
+
+      - name: Commit Progress
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add business_websites.csv || true
+          git add completed_queries.txt || true
+          git add failed_queries.txt || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Auto scraper progress update [skip ci]"
+            git push
+          fi
