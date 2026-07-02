@@ -10,8 +10,8 @@ from urllib.parse import urljoin
 from tqdm import tqdm
 
 # ================= CONFIG =================
-INPUT_CSV  = "current_batch.csv"   # ← SAHI HAI
-OUTPUT_CSV = "business_emails.csv"
+INPUT_CSV  = "business_emails.csv"   # ← SAHI HAI
+OUTPUT_CSV = "current_batch.csv" 
 TIMEOUT    = 3
 DELAY      = 0.5
 
