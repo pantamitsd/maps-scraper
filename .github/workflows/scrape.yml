@@ -34,13 +34,22 @@ jobs:
         run: |
           python scraper.py
 
-      - name: Upload CSV
+      - name: Run Email Extractor
+        run: |
+          if [ -f business_websites.csv ]; then
+            python website_email_extractor.py
+          else
+            echo "No websites CSV yet, skipping"
+          fi
+
+      - name: Upload CSVs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: business_websites
+          name: scraped_data
           path: |
             business_websites.csv
+            business_emails.csv
             completed_queries.txt
             failed_queries.txt
 
@@ -50,6 +59,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add business_websites.csv || true
+          git add business_emails.csv || true
           git add completed_queries.txt || true
           git add failed_queries.txt || true
           if git diff --cached --quiet; then
